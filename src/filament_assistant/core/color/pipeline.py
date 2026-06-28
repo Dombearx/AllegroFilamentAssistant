@@ -24,6 +24,30 @@ logger = logging.getLogger(__name__)
 _IMAGE_CACHE_TTL = 86400 * 30   # 30 days — extracted colour per image URL
 _MAX_IMAGES_PER_OFFER = 3       # only process the first N images per offer
 
+# App-level process pool — initialised by init_executor() on startup so worker
+# processes are reused across searches instead of spawned per call.
+_executor: ProcessPoolExecutor | None = None
+
+
+def init_executor(max_workers: int | None = None) -> None:
+    """Create the shared process pool.  Call once on application startup."""
+    global _executor
+    if _executor is not None:
+        return
+    settings = get_settings()
+    workers = max_workers or max(1, settings.image_concurrency // 2)
+    _executor = ProcessPoolExecutor(max_workers=workers)
+    logger.info("Process pool initialised with %d workers", workers)
+
+
+def shutdown_executor(wait: bool = True) -> None:
+    """Shut down the shared process pool.  Call on application shutdown."""
+    global _executor
+    if _executor is not None:
+        _executor.shutdown(wait=wait)
+        _executor = None
+        logger.info("Process pool shut down")
+
 
 def _image_cache_key(url: str) -> str:
     return "img_color:" + hashlib.sha256(url.encode()).hexdigest()[:16]
@@ -60,7 +84,6 @@ async def _color_for_url(
     client: httpx.AsyncClient,
     executor: ProcessPoolExecutor,
     target_is_neutral: bool,
-    loop: asyncio.AbstractEventLoop,
 ) -> ColorResult | None:
     cache_key = _image_cache_key(url)
     cached = cache_get(cache_key)
@@ -71,7 +94,7 @@ async def _color_for_url(
     if image_bytes is None:
         return None
 
-    result: ColorResult | None = await loop.run_in_executor(
+    result: ColorResult | None = await asyncio.get_running_loop().run_in_executor(
         executor, _process_image_bytes, image_bytes, target_is_neutral
     )
 
@@ -100,6 +123,10 @@ async def process_offers(
     Async generator: for each offer, download its images, extract the dominant
     filament colour, and yield a RankedOffer if within the ΔE threshold.
     Offers are processed concurrently (bounded by IMAGE_CONCURRENCY).
+
+    Uses the app-level process pool when available (see init_executor); falls
+    back to a per-call pool otherwise so the function is self-contained in
+    tests and CLI usage.
     """
     settings = get_settings()
     if threshold is None:
@@ -107,7 +134,6 @@ async def process_offers(
 
     target_is_neutral = chroma_of_hex(target_hex) < 15.0
     semaphore = asyncio.Semaphore(settings.image_concurrency)
-    loop = asyncio.get_event_loop()
 
     async def _process_offer(
         offer: Offer,
@@ -120,7 +146,7 @@ async def process_offers(
                 return None
 
             tasks = [
-                _color_for_url(url, client, executor, target_is_neutral, loop)
+                _color_for_url(url, client, executor, target_is_neutral)
                 for url in urls
             ]
             results = await asyncio.gather(*tasks)
@@ -131,10 +157,19 @@ async def process_offers(
             ranked = rank_offers([(offer, color)], target_hex, threshold)
             return ranked[0] if ranked else None
 
-    async with httpx.AsyncClient() as client:
-        with ProcessPoolExecutor(max_workers=max(1, settings.image_concurrency // 2)) as ex:
-            tasks = [_process_offer(offer, client, ex) for offer in offers]
-            for coro in asyncio.as_completed(tasks):
+    owned = _executor is None
+    executor = (
+        _executor
+        if _executor is not None
+        else ProcessPoolExecutor(max_workers=max(1, settings.image_concurrency // 2))
+    )
+    try:
+        async with httpx.AsyncClient() as client:
+            coros = [_process_offer(offer, client, executor) for offer in offers]
+            for coro in asyncio.as_completed(coros):
                 result = await coro
                 if result is not None:
                     yield result
+    finally:
+        if owned:
+            executor.shutdown(wait=False)

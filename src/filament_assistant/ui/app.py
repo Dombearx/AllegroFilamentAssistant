@@ -1,7 +1,8 @@
 import asyncio
 import logging
+import re
 
-from nicegui import ui
+from nicegui import app, ui
 
 from filament_assistant.config import get_settings
 from filament_assistant.core.allegro.categories import (
@@ -13,10 +14,38 @@ from filament_assistant.core.allegro.categories import (
 from filament_assistant.core.allegro.client import AllegroClient
 from filament_assistant.core.allegro.models import FilamentFilters
 from filament_assistant.core.color.matching import RankedOffer
-from filament_assistant.core.color.pipeline import process_offers
+from filament_assistant.core.color.pipeline import (
+    init_executor,
+    process_offers,
+    shutdown_executor,
+)
 
 logger = logging.getLogger(__name__)
 
+_HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+_startup_error: str | None = None
+
+
+# ── App lifecycle ─────────────────────────────────────────────────────────────
+
+@app.on_startup
+async def _on_startup() -> None:
+    global _startup_error
+    try:
+        get_settings()
+        init_executor()
+        logger.info("Filament Assistant started")
+    except Exception as exc:
+        _startup_error = str(exc)
+        logger.error("Startup error: %s", exc)
+
+
+@app.on_shutdown
+def _on_shutdown() -> None:
+    shutdown_executor(wait=False)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 async def _load_filters() -> FilamentFilters | None:
     try:
@@ -45,19 +74,33 @@ def _render_result(ranked: RankedOffer, container: ui.column) -> None:
                     if ranked.offer.price:
                         p = ranked.offer.price
                         ui.label(f"{p.amount} {p.currency}").classes("text-xs text-gray-500")
-                # ΔE badge
+                # ΔE badge — green < 5, orange < 12, red ≥ 12
                 de = ranked.delta_e
-                color = "green" if de < 5 else ("orange" if de < 12 else "red")
-                ui.badge(f"ΔE {de:.1f}", color=color)
+                badge_color = "green" if de < 5 else ("orange" if de < 12 else "red")
+                ui.badge(f"ΔE {de:.1f}", color=badge_color)
                 # Allegro link
                 ui.link("Open ↗", ranked.offer.url, new_tab=True).classes(
                     "text-xs text-blue-500 flex-shrink-0"
                 )
 
 
+# ── Pages ─────────────────────────────────────────────────────────────────────
+
 @ui.page("/")
 async def main_page() -> None:
     ui.page_title("Filament Color Finder")
+
+    if _startup_error:
+        with ui.column().classes("w-full max-w-2xl mx-auto p-4 gap-4"):
+            ui.label("Filament Color Finder").classes("text-2xl font-bold")
+            with ui.card().classes("w-full p-4 bg-red-50"):
+                ui.label("Configuration error").classes("text-lg font-semibold text-red-700")
+                ui.label(_startup_error).classes("text-sm text-red-600 font-mono")
+                ui.label(
+                    "Copy .env.example to .env, fill in your Allegro API credentials, "
+                    "then restart the app."
+                ).classes("text-sm text-gray-600 mt-2")
+        return
 
     filters = await _load_filters()
 
@@ -118,6 +161,11 @@ async def main_page() -> None:
 
     async def run_search() -> None:
         target_hex: str = hex_input.value or "#FF0000"
+
+        if not _HEX_RE.match(target_hex):
+            ui.notify("Invalid hex colour — expected format #rrggbb", type="warning")
+            return
+
         brand_ids: list[str] = list(brands_select.value or [])
         type_ids: list[str] = list(types_select.value or [])
         threshold: float = float(threshold_slider.value)
@@ -151,7 +199,8 @@ async def main_page() -> None:
             async for ranked in process_offers(offers, target_hex, threshold):
                 count += 1
                 _render_result(ranked, results_col)
-                status_label.text = f"Found {count} match{'es' if count != 1 else ''} so far…"
+                plural = "es" if count != 1 else ""
+                status_label.text = f"Found {count} match{plural} so far…"
                 await asyncio.sleep(0)
 
             if count:
