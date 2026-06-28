@@ -2,6 +2,7 @@ import json
 import logging
 from typing import Any
 
+from filament_assistant.config import get_settings
 from filament_assistant.core.allegro.client import AllegroClient
 from filament_assistant.core.allegro.models import (
     FilamentFilters,
@@ -31,6 +32,12 @@ _TYPE_KEYWORDS = {"materiał", "material", "rodzaj", "typ", "type"}
 
 
 async def _find_filament_category(client: AllegroClient) -> str:
+    # Pinned ID in config: skip all discovery and cache logic.
+    pinned = get_settings().allegro_filament_category_id
+    if pinned:
+        logger.debug("Using pinned filament category ID: %s", pinned)
+        return pinned
+
     cached = cache_get(_CATEGORY_CACHE_KEY)
     if cached is not None:
         logger.debug("Filament category ID from cache: %s", cached)
