@@ -14,11 +14,14 @@ from filament_assistant.core.allegro.categories import (
     search_offers,
 )
 from filament_assistant.core.allegro.client import AllegroClient
+from filament_assistant.core.allegro.color_match import closest_allegro_colour
 from filament_assistant.core.allegro.models import FilamentFilters
 from filament_assistant.core.color.matching import RankedOffer
 from filament_assistant.core.color.pipeline import (
+    get_debug_mode,
     init_executor,
     process_offers,
+    set_debug_mode,
     shutdown_executor,
 )
 from filament_assistant.core.search.history import (
@@ -96,12 +99,52 @@ def _render_result(ranked: RankedOffer, container: ui.column) -> None:
                     "text-xs text-blue-500 flex-shrink-0"
                 )
 
+            if ranked.debug:
+                with ui.expansion("Debug", icon="bug_report").classes("w-full mt-1").props(
+                    "dense"
+                ):
+                    with ui.column().classes("gap-3 p-2"):
+                        for dbg in ranked.debug:
+                            with ui.row().classes("items-start gap-3 flex-wrap"):
+                                if dbg.fg_image_b64:
+                                    ui.image(
+                                        f"data:image/png;base64,{dbg.fg_image_b64}"
+                                    ).style(
+                                        "width:64px;height:64px;object-fit:cover;"
+                                        "border-radius:4px;border:1px solid rgba(0,0,0,0.1)"
+                                    )
+                                if dbg.color:
+                                    with ui.column().classes("gap-1"):
+                                        ui.element("div").style(
+                                            f"width:24px;height:24px;"
+                                            f"background:{dbg.color.hex};"
+                                            "border-radius:3px;"
+                                            "border:1px solid rgba(0,0,0,0.15)"
+                                        )
+                                        ui.label(dbg.color.hex).classes(
+                                            "text-xs font-mono text-gray-500"
+                                        )
+                                        ui.label(
+                                            f"conf {dbg.color.confidence:.2f}"
+                                        ).classes("text-xs text-gray-400")
+                                ui.label(dbg.url.split("/")[-1]).classes(
+                                    "text-xs text-gray-400 self-center"
+                                ).style("word-break:break-all")
+
 
 # ── Pages ─────────────────────────────────────────────────────────────────────
 
 @ui.page("/")
 async def main_page() -> None:
     ui.page_title("Filament Color Finder")
+
+    dark = ui.dark_mode()
+    if app.storage.user.get("dark_mode", False):
+        dark.enable()
+
+    def _toggle_dark() -> None:
+        dark.toggle()
+        app.storage.user["dark_mode"] = dark.value
 
     if _startup_error:
         with ui.column().classes("w-full max-w-2xl mx-auto p-4 gap-4"):
@@ -121,7 +164,11 @@ async def main_page() -> None:
         # ── Header ──────────────────────────────────────────────────────────
         with ui.row().classes("w-full items-center justify-between"):
             ui.label("Filament Color Finder").classes("text-2xl font-bold")
-            ui.link("⚙ Dev", "/dev").classes("text-sm text-gray-400 no-underline")
+            with ui.row().classes("items-center gap-2"):
+                ui.button(icon="dark_mode", on_click=_toggle_dark).props(
+                    "flat round dense"
+                ).tooltip("Toggle dark mode")
+                ui.link("⚙ Dev", "/dev").classes("text-sm text-gray-400 no-underline")
 
         # ── Search form ──────────────────────────────────────────────────────
         with ui.card().classes("w-full p-4"):
@@ -154,6 +201,47 @@ async def main_page() -> None:
                     .classes("w-full")
                     .props("outlined use-chips")
                 )
+
+                # ── Allegro colour filter ────────────────────────────────────
+                with ui.column().classes("w-full gap-2"):
+                    ui.label("Allegro colour filter").classes("text-sm text-gray-500")
+                    color_mode = ui.radio(
+                        {"off": "Off", "auto": "Auto", "manual": "Manual"},
+                        value="off",
+                    ).props("inline")
+
+                    color_opts = (
+                        {v.id: v.name for v in filters.colors} if filters else {}
+                    )
+                    color_select = (
+                        ui.select(
+                            options=color_opts,
+                            multiple=False,
+                            label="Colour",
+                            clearable=True,
+                        )
+                        .classes("w-full")
+                        .props("outlined")
+                    )
+                    color_select.visible = False
+
+                    auto_color_label = ui.label("").classes("text-xs text-blue-500")
+                    auto_color_label.visible = False
+
+                def _update_color_filter() -> None:
+                    mode = color_mode.value
+                    color_select.visible = mode == "manual"
+                    auto_color_label.visible = mode == "auto"
+                    if mode == "auto" and filters and filters.colors:
+                        match = closest_allegro_colour(
+                            hex_input.value or "#FF0000", filters.colors
+                        )
+                        auto_color_label.set_text(
+                            f"Matched: {match.name}" if match else "No colour match"
+                        )
+
+                hex_input.on_value_change(lambda _: _update_color_filter())
+                color_mode.on_value_change(lambda _: _update_color_filter())
 
                 with ui.column().classes("w-full gap-1"):
                     threshold_label = ui.label("Max ΔE: 10.0").classes("text-sm text-gray-500")
@@ -221,6 +309,7 @@ async def main_page() -> None:
         "target_hex": "#FF5733",
         "brand_ids": [],
         "type_ids": [],
+        "color_ids": [],
         "threshold": 10.0,
         "result_count": 0,
     }
@@ -248,10 +337,20 @@ async def main_page() -> None:
         threshold: float = float(threshold_slider.value)
         max_offers = get_settings().max_offers
 
+        # Resolve colour filter
+        if color_mode.value == "auto" and filters and filters.colors:
+            match = closest_allegro_colour(target_hex, filters.colors)
+            color_ids: list[str] = [match.id] if match else []
+        elif color_mode.value == "manual" and color_select.value:
+            color_ids = [color_select.value]
+        else:
+            color_ids = []
+
         state.update(
             target_hex=target_hex,
             brand_ids=brand_ids,
             type_ids=type_ids,
+            color_ids=color_ids,
             threshold=threshold,
             offset=0,
             total_count=0,
@@ -273,6 +372,7 @@ async def main_page() -> None:
                         client,
                         brand_ids=brand_ids or None,
                         type_ids=type_ids or None,
+                        color_ids=color_ids or None,
                         limit=min(page_size, max_offers - len(offers)),
                         offset=len(offers),
                     )
@@ -337,6 +437,7 @@ async def main_page() -> None:
                     client,
                     brand_ids=state["brand_ids"] or None,
                     type_ids=state["type_ids"] or None,
+                    color_ids=state["color_ids"] or None,
                     limit=60,
                     offset=state["offset"],
                 )
@@ -383,6 +484,10 @@ async def dev_page() -> None:
     ui.page_title("Dev Settings — Filament Assistant")
     settings = get_settings()
 
+    dark = ui.dark_mode()
+    if app.storage.user.get("dark_mode", False):
+        dark.enable()
+
     with ui.column().classes("w-full max-w-xl mx-auto p-4 gap-4"):
         with ui.row().classes("w-full items-center gap-4"):
             ui.label("Dev Settings").classes("text-2xl font-bold")
@@ -420,6 +525,15 @@ async def dev_page() -> None:
 
         ui.separator()
 
+        ui.label("Debug").classes("text-lg font-semibold")
+        ui.switch(
+            "Enable debug panels on results",
+            value=get_debug_mode(),
+            on_change=lambda e: set_debug_mode(e.value),
+        )
+
+        ui.separator()
+
         ui.label("Allegro").classes("text-lg font-semibold")
         for label, value in [
             ("Environment", settings.allegro_env),
@@ -442,4 +556,5 @@ def create_app() -> None:
         reload=False,
         show=False,
         dark=False,
+        storage_secret=os.environ.get("STORAGE_SECRET", "filament-assistant-dev-secret"),
     )

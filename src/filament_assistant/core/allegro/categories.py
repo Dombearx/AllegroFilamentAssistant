@@ -16,7 +16,8 @@ from filament_assistant.core.cache import cache_delete, cache_get, cache_set
 logger = logging.getLogger(__name__)
 
 _CATEGORY_CACHE_KEY = "allegro_filament_category"
-_FILTERS_CACHE_KEY = "allegro_filament_filters"
+# v2 includes param IDs and colour list — old entries are ignored automatically.
+_FILTERS_CACHE_KEY = "allegro_filament_filters_v2"
 
 # Known path on Allegro prod (and mirrored on sandbox):
 #   Elektronika → Komputery → Drukarki i skanery → Drukarki 3D → Filamenty
@@ -25,6 +26,7 @@ _CATEGORY_PATH = ["elektronika", "komputer", "drukark", "3d", "filament"]
 
 _BRAND_KEYWORDS = {"marka", "brand", "producent", "manufacturer"}
 _TYPE_KEYWORDS = {"materiał", "material", "rodzaj", "typ", "type"}
+_COLOR_KEYWORDS = {"kolor", "barwa", "color", "colour"}
 
 
 async def _find_filament_category(client: AllegroClient) -> str:
@@ -97,8 +99,12 @@ async def get_filament_filters(client: AllegroClient) -> FilamentFilters:
     if cached is not None:
         data = json.loads(cached)
         return FilamentFilters(
-            brands=[ParamValue(**v) for v in data["brands"]],
-            types=[ParamValue(**v) for v in data["types"]],
+            brands=[ParamValue(**v) for v in data.get("brands", [])],
+            types=[ParamValue(**v) for v in data.get("types", [])],
+            colors=[ParamValue(**v) for v in data.get("colors", [])],
+            brand_param_id=data.get("brand_param_id"),
+            type_param_id=data.get("type_param_id"),
+            color_param_id=data.get("color_param_id"),
         )
 
     category_id = await _find_filament_category(client)
@@ -107,21 +113,30 @@ async def get_filament_filters(client: AllegroClient) -> FilamentFilters:
 
     brand_param = _find_param(params, _BRAND_KEYWORDS)
     type_param = _find_param(params, _TYPE_KEYWORDS)
+    color_param = _find_param(params, _COLOR_KEYWORDS)
 
     filters = FilamentFilters(
         brands=_extract_values(brand_param),
         types=_extract_values(type_param),
+        colors=_extract_values(color_param),
+        brand_param_id=brand_param["id"] if brand_param else None,
+        type_param_id=type_param["id"] if type_param else None,
+        color_param_id=color_param["id"] if color_param else None,
     )
     cache_set(
         _FILTERS_CACHE_KEY,
         json.dumps({
             "brands": [{"id": v.id, "name": v.name} for v in filters.brands],
             "types": [{"id": v.id, "name": v.name} for v in filters.types],
+            "colors": [{"id": v.id, "name": v.name} for v in filters.colors],
+            "brand_param_id": filters.brand_param_id,
+            "type_param_id": filters.type_param_id,
+            "color_param_id": filters.color_param_id,
         }),
     )  # no TTL → permanent; use invalidate_filters() to force refresh
     logger.info(
-        "Discovered %d brands, %d types for category %s",
-        len(filters.brands), len(filters.types), category_id,
+        "Discovered %d brands, %d types, %d colours for category %s",
+        len(filters.brands), len(filters.types), len(filters.colors), category_id,
     )
     return filters
 
@@ -138,27 +153,16 @@ def invalidate_category() -> None:
     logger.info("Filament category cache cleared")
 
 
-async def _get_filter_param_ids(client: AllegroClient) -> tuple[str | None, str | None]:
-    category_id = await _find_filament_category(client)
-    data = await client.get(f"/sale/categories/{category_id}/parameters")
-    params: list[dict[str, Any]] = data.get("parameters", [])
-    brand_param = _find_param(params, _BRAND_KEYWORDS)
-    type_param = _find_param(params, _TYPE_KEYWORDS)
-    return (
-        brand_param["id"] if brand_param else None,
-        type_param["id"] if type_param else None,
-    )
-
-
 async def search_offers(
     client: AllegroClient,
     brand_ids: list[str] | None = None,
     type_ids: list[str] | None = None,
+    color_ids: list[str] | None = None,
     limit: int = 60,
     offset: int = 0,
 ) -> ListingPage:
     category_id = await _find_filament_category(client)
-    brand_param_id, type_param_id = await _get_filter_param_ids(client)
+    filters = await get_filament_filters(client)
 
     params: dict[str, Any] = {
         "category.id": category_id,
@@ -166,11 +170,14 @@ async def search_offers(
         "offset": offset,
     }
 
-    if brand_ids and brand_param_id:
-        params[f"parameter.{brand_param_id}"] = brand_ids
+    if brand_ids and filters.brand_param_id:
+        params[f"parameter.{filters.brand_param_id}"] = brand_ids
 
-    if type_ids and type_param_id:
-        params[f"parameter.{type_param_id}"] = type_ids
+    if type_ids and filters.type_param_id:
+        params[f"parameter.{filters.type_param_id}"] = type_ids
+
+    if color_ids and filters.color_param_id:
+        params[f"parameter.{filters.color_param_id}"] = color_ids
 
     data = await client.get("/offers/listing", params=params)
     return _parse_listing(data, offset=offset, limit=limit)

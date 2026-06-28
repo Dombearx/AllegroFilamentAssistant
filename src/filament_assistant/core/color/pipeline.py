@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import logging
 import pickle
@@ -16,7 +17,7 @@ from filament_assistant.core.color.dominant import (
     chroma_of_hex,
     extract_dominant_color,
 )
-from filament_assistant.core.color.matching import RankedOffer, rank_offers
+from filament_assistant.core.color.matching import ImageDebugInfo, RankedOffer, rank_offers
 from filament_assistant.core.color.segmentation import remove_background
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,8 @@ _MAX_IMAGES_PER_OFFER = 3       # only process the first N images per offer
 # App-level process pool — initialised by init_executor() on startup so worker
 # processes are reused across searches instead of spawned per call.
 _executor: ProcessPoolExecutor | None = None
+
+_debug_mode: bool = False
 
 
 def init_executor(max_workers: int | None = None) -> None:
@@ -49,6 +52,16 @@ def shutdown_executor(wait: bool = True) -> None:
         logger.info("Process pool shut down")
 
 
+def set_debug_mode(enabled: bool) -> None:
+    global _debug_mode
+    _debug_mode = enabled
+    logger.info("Debug mode %s", "enabled" if enabled else "disabled")
+
+
+def get_debug_mode() -> bool:
+    return _debug_mode
+
+
 def _image_cache_key(url: str) -> str:
     return "img_color:" + hashlib.sha256(url.encode()).hexdigest()[:16]
 
@@ -65,6 +78,23 @@ def _process_image_bytes(image_bytes: bytes, target_is_neutral: bool) -> ColorRe
     except Exception as exc:
         logger.warning("Image processing failed: %s", exc)
         return None
+
+
+def _process_image_bytes_debug(
+    image_bytes: bytes, target_is_neutral: bool
+) -> tuple[ColorResult | None, bytes | None]:
+    """Same as _process_image_bytes but also returns the foreground PNG bytes."""
+    try:
+        import io
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        fg = remove_background(image)
+        color = extract_dominant_color(fg, target_is_neutral=target_is_neutral)
+        buf = io.BytesIO()
+        fg.save(buf, format="PNG")
+        return color, buf.getvalue()
+    except Exception as exc:
+        logger.warning("Image processing (debug) failed: %s", exc)
+        return None, None
 
 
 # ── Async helpers ─────────────────────────────────────────────────────────────
@@ -84,24 +114,33 @@ async def _color_for_url(
     client: httpx.AsyncClient,
     executor: ProcessPoolExecutor,
     target_is_neutral: bool,
-) -> ColorResult | None:
+    debug: bool = False,
+) -> tuple[ColorResult | None, str | None]:
+    """Return (color, fg_b64). fg_b64 is only populated in debug mode."""
     cache_key = _image_cache_key(url)
-    cached = cache_get(cache_key)
-    if cached is not None:
-        return pickle.loads(cached)  # noqa: S301
+
+    if not debug:
+        cached = cache_get(cache_key)
+        if cached is not None:
+            return pickle.loads(cached), None  # noqa: S301
 
     image_bytes = await _download(url, client)
     if image_bytes is None:
-        return None
+        return None, None
+
+    if debug:
+        color, fg_bytes = await asyncio.get_running_loop().run_in_executor(
+            executor, _process_image_bytes_debug, image_bytes, target_is_neutral
+        )
+        fg_b64 = base64.b64encode(fg_bytes).decode() if fg_bytes else None
+        return color, fg_b64
 
     result: ColorResult | None = await asyncio.get_running_loop().run_in_executor(
         executor, _process_image_bytes, image_bytes, target_is_neutral
     )
-
     if result is not None:
         cache_set(cache_key, pickle.dumps(result), ttl=_IMAGE_CACHE_TTL)
-
-    return result
+    return result, None
 
 
 def _best_color(results: list[ColorResult | None]) -> ColorResult | None:
@@ -145,17 +184,27 @@ async def process_offers(
             if not urls:
                 return None
 
+            debug = get_debug_mode()
             tasks = [
-                _color_for_url(url, client, executor, target_is_neutral)
+                _color_for_url(url, client, executor, target_is_neutral, debug)
                 for url in urls
             ]
-            results = await asyncio.gather(*tasks)
-            color = _best_color(list(results))
+            pairs: list[tuple[ColorResult | None, str | None]] = await asyncio.gather(*tasks)
+            color = _best_color([c for c, _ in pairs])
             if color is None:
                 return None
 
             ranked = rank_offers([(offer, color)], target_hex, threshold)
-            return ranked[0] if ranked else None
+            if not ranked:
+                return None
+
+            result = ranked[0]
+            if debug:
+                result.debug = [
+                    ImageDebugInfo(url=url, fg_image_b64=fg_b64, color=cr)
+                    for url, (cr, fg_b64) in zip(urls, pairs)
+                ]
+            return result
 
     owned = _executor is None
     executor = (

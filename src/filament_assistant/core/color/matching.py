@@ -1,6 +1,6 @@
 import logging
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import colour
 import numpy as np
@@ -15,10 +15,18 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class ImageDebugInfo:
+    url: str
+    fg_image_b64: str | None  # base64 PNG of rembg foreground
+    color: ColorResult | None
+
+
+@dataclass
 class RankedOffer:
     offer: Offer
     color: ColorResult
     delta_e: float
+    debug: list[ImageDebugInfo] | None = field(default=None)
 
 
 def hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
