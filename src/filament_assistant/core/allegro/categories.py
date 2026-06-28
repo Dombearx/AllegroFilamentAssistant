@@ -11,13 +11,12 @@ from filament_assistant.core.allegro.models import (
     ParamValue,
     Price,
 )
-from filament_assistant.core.cache import cache_get, cache_set
+from filament_assistant.core.cache import cache_delete, cache_get, cache_set
 
 logger = logging.getLogger(__name__)
 
 _CATEGORY_CACHE_KEY = "allegro_filament_category"
 _FILTERS_CACHE_KEY = "allegro_filament_filters"
-_FILTERS_CACHE_TTL = 86400  # 1 day — brand/type values change occasionally
 
 # Known path on Allegro prod (and mirrored on sandbox):
 #   Elektronika → Komputery → Drukarki i skanery → Drukarki 3D → Filamenty
@@ -119,13 +118,24 @@ async def get_filament_filters(client: AllegroClient) -> FilamentFilters:
             "brands": [{"id": v.id, "name": v.name} for v in filters.brands],
             "types": [{"id": v.id, "name": v.name} for v in filters.types],
         }),
-        ttl=_FILTERS_CACHE_TTL,
-    )
+    )  # no TTL → permanent; use invalidate_filters() to force refresh
     logger.info(
         "Discovered %d brands, %d types for category %s",
         len(filters.brands), len(filters.types), category_id,
     )
     return filters
+
+
+def invalidate_filters() -> None:
+    """Clear the cached filter list; next call to get_filament_filters will re-fetch."""
+    cache_delete(_FILTERS_CACHE_KEY)
+    logger.info("Filament filters cache cleared")
+
+
+def invalidate_category() -> None:
+    """Clear the cached category ID; next search will re-walk the category path."""
+    cache_delete(_CATEGORY_CACHE_KEY)
+    logger.info("Filament category cache cleared")
 
 
 async def _get_filter_param_ids(client: AllegroClient) -> tuple[str | None, str | None]:
