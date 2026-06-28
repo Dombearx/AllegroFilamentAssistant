@@ -9,10 +9,6 @@ class Settings(BaseSettings):
     allegro_client_secret: str
     allegro_env: str = "sandbox"
 
-    # If set, skip category discovery and use this ID directly.
-    # Find it once with `uv run allegro-smoke-test --discover-category`, then pin it here.
-    allegro_filament_category_id: str | None = None
-
     max_offers: int = 120
     image_concurrency: int = 8
     delta_e_threshold: float = 10.0

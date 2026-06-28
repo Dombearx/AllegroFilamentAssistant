@@ -15,21 +15,14 @@ def _settings() -> Settings:
     )
 
 
-_TOP_CATEGORIES = {
-    "categories": [
-        {"id": "druk3d", "name": "Druk 3D"},
-        {"id": "other", "name": "Inne"},
-    ]
-}
-
-_DRUK3D_CHILDREN = {
-    "categories": [
-        {"id": "filament_cat", "name": "Filamenty do drukarek 3D"},
-        {"id": "printers", "name": "Drukarki 3D"},
-    ]
-}
-
-_EMPTY_CATEGORIES = {"categories": []}
+# Mirrors the known path: elektronika→komputer→drukark→3d→filament
+_PATH_RESPONSES = [
+    {"categories": [{"id": "el", "name": "Elektronika"}, {"id": "x", "name": "Inne"}]},
+    {"categories": [{"id": "kom", "name": "Komputery"}, {"id": "y", "name": "Inne"}]},
+    {"categories": [{"id": "ds", "name": "Drukarki i skanery"}, {"id": "z", "name": "Inne"}]},
+    {"categories": [{"id": "d3d", "name": "Drukarki 3D"}, {"id": "w", "name": "Inne"}]},
+    {"categories": [{"id": "fil", "name": "Filamenty"}, {"id": "v", "name": "Inne"}]},
+]
 
 _PARAMETERS = {
     "parameters": [
@@ -68,16 +61,19 @@ _LISTING = {
 }
 
 
-def _mock_category_tree(api: str):
-    """Set up a single dispatcher for all /sale/categories calls."""
-    _children = {
-        None: _TOP_CATEGORIES,
-        "druk3d": _DRUK3D_CHILDREN,
+def _mock_category_path(api: str) -> None:
+    """Return each path step's children in order, keyed by parent.id."""
+    _by_parent = {
+        None:  _PATH_RESPONSES[0],
+        "el":  _PATH_RESPONSES[1],
+        "kom": _PATH_RESPONSES[2],
+        "ds":  _PATH_RESPONSES[3],
+        "d3d": _PATH_RESPONSES[4],
     }
 
     def dispatcher(request: httpx.Request) -> httpx.Response:
         parent_id = request.url.params.get("parent.id")
-        return httpx.Response(200, json=_children.get(parent_id, _EMPTY_CATEGORIES))
+        return httpx.Response(200, json=_by_parent[parent_id])
 
     respx.get(f"{api}/sale/categories").mock(side_effect=dispatcher)
 
@@ -92,8 +88,8 @@ async def test_get_filament_filters():
         respx.post(f"{auth}/auth/oauth/token").mock(
             return_value=httpx.Response(200, json={"access_token": "tok", "expires_in": 3600})
         )
-        _mock_category_tree(api)
-        respx.get(f"{api}/sale/categories/filament_cat/parameters").mock(
+        _mock_category_path(api)
+        respx.get(f"{api}/sale/categories/fil/parameters").mock(
             return_value=httpx.Response(200, json=_PARAMETERS)
         )
 
@@ -107,6 +103,40 @@ async def test_get_filament_filters():
 
 
 @pytest.mark.asyncio
+async def test_category_id_cached_permanently():
+    """Second call must not hit /sale/categories at all — served from disk cache."""
+    settings = _settings()
+    api = settings.api_base
+    auth = settings.auth_base
+
+    with respx.mock:
+        respx.post(f"{auth}/auth/oauth/token").mock(
+            return_value=httpx.Response(200, json={"access_token": "tok", "expires_in": 3600})
+        )
+        _mock_category_path(api)
+        respx.get(f"{api}/sale/categories/fil/parameters").mock(
+            return_value=httpx.Response(200, json=_PARAMETERS)
+        )
+
+        async with AllegroClient(settings) as client:
+            await get_filament_filters(client)
+            categories_call_count = sum(
+                1 for c in respx.calls if "/sale/categories" in str(c.request.url)
+                and "/parameters" not in str(c.request.url)
+            )
+
+            # Second call: must use cache, so no more /sale/categories calls.
+            await get_filament_filters(client)
+            categories_call_count_after = sum(
+                1 for c in respx.calls if "/sale/categories" in str(c.request.url)
+                and "/parameters" not in str(c.request.url)
+            )
+
+    assert categories_call_count == 5  # one per path step
+    assert categories_call_count_after == 5  # no new calls on second lookup
+
+
+@pytest.mark.asyncio
 async def test_search_offers_returns_parsed_offers():
     settings = _settings()
     api = settings.api_base
@@ -116,8 +146,8 @@ async def test_search_offers_returns_parsed_offers():
         respx.post(f"{auth}/auth/oauth/token").mock(
             return_value=httpx.Response(200, json={"access_token": "tok", "expires_in": 3600})
         )
-        _mock_category_tree(api)
-        respx.get(f"{api}/sale/categories/filament_cat/parameters").mock(
+        _mock_category_path(api)
+        respx.get(f"{api}/sale/categories/fil/parameters").mock(
             return_value=httpx.Response(200, json=_PARAMETERS)
         )
         respx.get(f"{api}/offers/listing").mock(
@@ -159,8 +189,8 @@ async def test_client_retries_on_429():
         respx.post(f"{auth}/auth/oauth/token").mock(
             return_value=httpx.Response(200, json={"access_token": "tok", "expires_in": 3600})
         )
-        _mock_category_tree(api)
-        respx.get(f"{api}/sale/categories/filament_cat/parameters").mock(
+        _mock_category_path(api)
+        respx.get(f"{api}/sale/categories/fil/parameters").mock(
             return_value=httpx.Response(200, json=_PARAMETERS)
         )
         respx.get(f"{api}/offers/listing").mock(side_effect=listing_side_effect)

@@ -2,7 +2,6 @@ import json
 import logging
 from typing import Any
 
-from filament_assistant.config import get_settings
 from filament_assistant.core.allegro.client import AllegroClient
 from filament_assistant.core.allegro.models import (
     FilamentFilters,
@@ -16,83 +15,82 @@ from filament_assistant.core.cache import cache_get, cache_set
 
 logger = logging.getLogger(__name__)
 
-# Cache keys and TTLs
 _CATEGORY_CACHE_KEY = "allegro_filament_category"
 _FILTERS_CACHE_KEY = "allegro_filament_filters"
-_CATEGORY_CACHE_TTL = 86400 * 7   # 7 days — category IDs rarely change
-_FILTERS_CACHE_TTL = 86400        # 1 day  — parameter values change occasionally
+_FILTERS_CACHE_TTL = 86400  # 1 day — brand/type values change occasionally
 
-# Polish / Allegro search terms for the 3D printing filament category.
-# High-weight keywords (score 3 each) identify the actual filament category leaf.
-# Low-weight keywords (score 1 each) identify ancestor / breadcrumb nodes worth descending.
-_FILAMENT_HIGH = {"filament", "filamet"}
-_FILAMENT_LOW = {"pla", "petg", "abs", "tpu", "druk 3d"}
+# Known path on Allegro prod (and mirrored on sandbox):
+#   Elektronika → Komputery → Drukarki i skanery → Drukarki 3D → Filamenty
+# Each entry is a substring matched case-insensitively against category names.
+_CATEGORY_PATH = ["elektronika", "komputer", "drukark", "3d", "filament"]
+
 _BRAND_KEYWORDS = {"marka", "brand", "producent", "manufacturer"}
 _TYPE_KEYWORDS = {"materiał", "material", "rodzaj", "typ", "type"}
 
 
 async def _find_filament_category(client: AllegroClient) -> str:
-    # Pinned ID in config: skip all discovery and cache logic.
-    pinned = get_settings().allegro_filament_category_id
-    if pinned:
-        logger.debug("Using pinned filament category ID: %s", pinned)
-        return pinned
-
+    # Stored permanently on first successful walk — never re-fetched.
     cached = cache_get(_CATEGORY_CACHE_KEY)
     if cached is not None:
-        logger.debug("Filament category ID from cache: %s", cached)
+        logger.debug("Filament category ID from disk cache: %s", cached)
         return cached
 
-    category_id = await _discover_category(client)
-    cache_set(_CATEGORY_CACHE_KEY, category_id, ttl=_CATEGORY_CACHE_TTL)
-    logger.info("Discovered filament category ID: %s", category_id)
+    category_id = await _walk_known_path(client)
+    cache_set(_CATEGORY_CACHE_KEY, category_id)  # no TTL → permanent
+    logger.info("Filament category ID saved to disk: %s", category_id)
     return category_id
 
 
-async def _discover_category(client: AllegroClient) -> str:
-    # Walk the category tree looking for a node whose name suggests 3D printing filament.
-    # Allegro's top-level categories include "Elektronika", "Dom i ogród", etc.
-    # We need to traverse into "Druk 3D" > "Filamenty" (or similar).
+async def _walk_known_path(client: AllegroClient) -> str:
+    """
+    Follow _CATEGORY_PATH one level at a time, matching each step by substring.
+    Makes exactly len(_CATEGORY_PATH) API calls total.
+    """
+    current_id: str | None = None
 
-    data = await client.get("/sale/categories")
-    top_categories = data.get("categories", [])
+    for step, keyword in enumerate(_CATEGORY_PATH):
+        params: dict[str, Any] = {}
+        if current_id is not None:
+            params["parent.id"] = current_id
 
-    # BFS; collect candidates scored by keyword match.
-    queue: list[dict[str, Any]] = list(top_categories)
-    best_id: str | None = None
-    best_score: int = -1
+        data = await client.get("/sale/categories", params=params or None)
+        children: list[dict[str, Any]] = data.get("categories", [])
 
-    visited: set[str] = set()
-    while queue:
-        node = queue.pop(0)
-        cat_id: str = node["id"]
-        if cat_id in visited:
-            continue
-        visited.add(cat_id)
-
-        name: str = node.get("name", "").lower()
-        score = _keyword_score(name, _FILAMENT_HIGH) * 3 + _keyword_score(name, _FILAMENT_LOW)
-        if score > best_score:
-            best_score = score
-            best_id = cat_id
-
-        # Fetch children for categories whose names hint at 3D printing; skip clear leaves.
-        _explore_kws = {"3d", "druk", "filament", "filamet", "technologia", "elektronik"}
-        if any(kw in name for kw in _explore_kws):
-            children_data = await client.get("/sale/categories", params={"parent.id": cat_id})
-            children = children_data.get("categories", [])
-            queue = children + queue  # depth-first into promising subtrees
-
-    if best_id is None:
-        raise RuntimeError(
-            "Could not find a filament category in the Allegro category tree. "
-            "Check that you are hitting the correct environment (prod/sandbox)."
+        match = next(
+            (c for c in children if keyword in c.get("name", "").lower()),
+            None,
         )
-    return best_id
+        if match is None:
+            names = [c.get("name", "") for c in children]
+            raise RuntimeError(
+                f"Category path walk failed at step {step} "
+                f"(looking for '{keyword}' among {names})"
+            )
+        current_id = match["id"]
+        logger.debug("Path step %d: '%s' → [%s] %s", step, keyword, current_id, match["name"])
+
+    assert current_id is not None
+    return current_id
 
 
 def _keyword_score(name: str, keywords: set[str]) -> int:
     return sum(1 for kw in keywords if kw in name)
+
+
+def _find_param(params: list[dict[str, Any]], keywords: set[str]) -> dict[str, Any] | None:
+    for p in params:
+        if _keyword_score(p.get("name", "").lower(), keywords) > 0:
+            return p
+    return None
+
+
+def _extract_values(param: dict[str, Any] | None) -> list[ParamValue]:
+    if param is None:
+        return []
+    return [
+        ParamValue(id=str(v["id"]), name=v.get("name", str(v["id"])))
+        for v in param.get("dictionary", [])
+    ]
 
 
 async def get_filament_filters(client: AllegroClient) -> FilamentFilters:
@@ -124,31 +122,13 @@ async def get_filament_filters(client: AllegroClient) -> FilamentFilters:
         ttl=_FILTERS_CACHE_TTL,
     )
     logger.info(
-        "Discovered %d brands and %d types for category %s",
+        "Discovered %d brands, %d types for category %s",
         len(filters.brands), len(filters.types), category_id,
     )
     return filters
 
 
-def _find_param(params: list[dict[str, Any]], keywords: set[str]) -> dict[str, Any] | None:
-    for p in params:
-        name = p.get("name", "").lower()
-        if _keyword_score(name, keywords) > 0:
-            return p
-    return None
-
-
-def _extract_values(param: dict[str, Any] | None) -> list[ParamValue]:
-    if param is None:
-        return []
-    return [
-        ParamValue(id=str(v["id"]), name=v.get("name", str(v["id"])))
-        for v in param.get("dictionary", [])
-    ]
-
-
-async def get_filter_params(client: AllegroClient) -> tuple[str | None, str | None]:
-    """Return (brand_param_id, type_param_id) for the filament category."""
+async def _get_filter_param_ids(client: AllegroClient) -> tuple[str | None, str | None]:
     category_id = await _find_filament_category(client)
     data = await client.get(f"/sale/categories/{category_id}/parameters")
     params: list[dict[str, Any]] = data.get("parameters", [])
@@ -168,7 +148,7 @@ async def search_offers(
     offset: int = 0,
 ) -> ListingPage:
     category_id = await _find_filament_category(client)
-    brand_param_id, type_param_id = await get_filter_params(client)
+    brand_param_id, type_param_id = await _get_filter_param_ids(client)
 
     params: dict[str, Any] = {
         "category.id": category_id,
@@ -177,7 +157,6 @@ async def search_offers(
     }
 
     if brand_ids and brand_param_id:
-        # httpx serialises lists as repeated query params automatically.
         params[f"parameter.{brand_param_id}"] = brand_ids
 
     if type_ids and type_param_id:
@@ -189,9 +168,7 @@ async def search_offers(
 
 def _parse_listing(data: dict[str, Any], offset: int, limit: int) -> ListingPage:
     items = data.get("items", {})
-    promoted: list[dict] = items.get("promoted", [])
-    regular: list[dict] = items.get("regular", [])
-    all_items = promoted + regular
+    all_items = items.get("promoted", []) + items.get("regular", [])
 
     offers: list[Offer] = []
     for item in all_items:
